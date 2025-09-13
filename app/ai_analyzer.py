@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from typing import List
 
 import re
+from typing import List, Dict
 
 from .models import AISuggestion, CostSlayerInfo
 
@@ -17,6 +18,44 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize OpenAI client: {e}")
     client = None
+
+def detect_query_patterns(query: str) -> Dict[str, List[str]]:
+    """
+    Detect common SQL bottleneck patterns:
+    - MAX/MIN subqueries
+    - Nested IN subqueries
+    - OR conditions
+    - Aggregations without filters
+    Returns a dict summarizing the patterns found.
+    """
+    patterns = {
+        "max_min_subqueries": [],
+        "nested_in_subqueries": [],
+        "or_conditions": [],
+        "aggregations_no_filter": [],
+    }
+
+    # Detect MAX()/MIN() in WHERE or SELECT as a subquery
+    max_min_matches = re.findall(r"\(\s*SELECT\s+(MAX|MIN)\([^\)]+\).*?\)", query, flags=re.IGNORECASE | re.DOTALL)
+    if max_min_matches:
+        patterns["max_min_subqueries"].extend(max_min_matches)
+
+    # Detect IN (SELECT ...) subqueries
+    in_matches = re.findall(r"IN\s*\(\s*SELECT[^\)]+\)", query, flags=re.IGNORECASE | re.DOTALL)
+    if in_matches:
+        patterns["nested_in_subqueries"].extend(in_matches)
+
+    # Detect OR conditions in WHERE clauses
+    or_matches = re.findall(r"\bWHERE\b.*\bOR\b.*", query, flags=re.IGNORECASE | re.DOTALL)
+    if or_matches:
+        patterns["or_conditions"].extend(or_matches)
+
+    # Detect aggregations without filters
+    agg_matches = re.findall(r"SELECT\s+.*\b(COUNT|SUM|AVG|MIN|MAX)\(", query, flags=re.IGNORECASE)
+    if agg_matches and "WHERE" not in query.upper():
+        patterns["aggregations_no_filter"].extend(agg_matches)
+
+    return patterns
     
 def is_safe_create_index(stmt: str) -> bool:
     """
@@ -76,38 +115,65 @@ def validate_and_parse_ai_response(raw: str, required_keys=("rewritten_query","n
 
 def construct_prompt(schema_details: str, query: str, query_plan: dict) -> str:
     """
-    Constructs a strict, example-backed prompt that forces a single minified JSON response.
+    Constructs an advanced PostgreSQL optimization prompt.
+    Includes multiple rewrite patterns, index suggestions, and cost-aware guidance.
+    AI must output a single minified JSON object: rewritten_query, new_index_suggestion, explanation.
     """
-    # small defensive extraction of top-level numeric fields for model context
     top_fields = {}
     if isinstance(query_plan, dict):
-        for k in ("Total Cost", "Plan Rows", "Actual Rows", "Node Type"):
+        for k in ("Total Cost", "Plan Rows", "Actual Rows", "Node Type", "Filter", "Join Type"):
             if k in query_plan:
                 top_fields[k] = query_plan[k]
-    # build prompt with explicit JSON shape + tiny example
-    return f"""
-You are an expert PostgreSQL performance analyst. Output MUST be a single minified JSON object with EXACT keys:
+
+    prompt = f"""
+You are an expert PostgreSQL performance analyst. Optimize queries for speed, cost, and scalability.
+Output MUST be a single minified JSON object with EXACT keys: 
 "rewritten_query", "new_index_suggestion", "explanation"
 
-Context:
+CONTEXT:
 SCHEMA:
 {schema_details}
 
 SLOW QUERY:
 {query}
 
-PLAN_TOP_FIELDS:
-{json.dumps(top_fields, ensure_ascii=False)}
+QUERY_PLAN:
+{json.dumps(query_plan, ensure_ascii=False)}
 
-Rules:
-1) If you recommend an index, it MUST exactly match: CREATE INDEX index_name ON table_name (col1, col2);
-2) If the query involves a VIEW, target the underlying base table(s).
-3) Prefer index suggestions only when they will reduce planner Total Cost; otherwise provide a rewritten_query.
-4) No markdown. No extra keys. No commentary outside the JSON object.
+RULES:
+1. Only generate syntactically correct PostgreSQL SQL.
+2. Always check for and optimize these patterns:
+   a) Per-row MAX/MIN subqueries → use ROW_NUMBER() or RANK() window functions.
+   b) OR conditions across multiple columns → consider UNION ALL.
+   c) Nested IN (SELECT ...) → rewrite as JOIN when possible.
+   d) Aggregations on large tables → push filters before aggregation.
+   e) JOINs on non-indexed columns → suggest covering index if it reduces Total Cost.
+3. Prefer index creation ONLY if it reduces Total Cost or speeds up joins/filters significantly. Use: CREATE INDEX index_name ON table_name(col1, col2);
+4. Push down WHERE filters early, flatten unnecessary nested queries.
+5. If no index is beneficial, set "new_index_suggestion": null.
+6. If query cannot be further optimized, set "rewritten_query": null.
+7. Explanation must briefly justify why the rewrite or index improves performance.
+8. Output JSON ONLY, no extra text, no markdown, no commentary.
+9. Format JSON EXACTLY: 
+   {{"rewritten_query":"...","new_index_suggestion":"...","explanation":"..."}}
 
-Example (this EXACT shape is required):
-{{"rewritten_query":"SELECT ...","new_index_suggestion":"CREATE INDEX idx_foo_bar ON foo(bar);","explanation":"index on foo.bar to speed join"}}
+EXAMPLES:
+Original query:
+SELECT fr.title, fr.total_revenue, fc.customer_id, fc.rental_count
+FROM film_revenue fr
+JOIN film_customers fc ON fr.film_id = fc.film_id
+WHERE fr.film_id IN (SELECT film_id FROM film_revenue ORDER BY total_revenue DESC LIMIT 10)
+  AND fc.rental_count = (SELECT MAX(fc2.rental_count) FROM film_customers fc2 WHERE fc2.film_id = fr.film_id);
+
+Optimized output:
+{{
+"rewritten_query":"WITH top_films AS (SELECT film_id FROM film_revenue ORDER BY total_revenue DESC LIMIT 10), ranked_customers AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY film_id ORDER BY rental_count DESC) AS rn FROM film_customers) SELECT fr.title, fr.total_revenue, rc.customer_id, rc.rental_count FROM film_revenue fr JOIN top_films tf ON fr.film_id = tf.film_id JOIN ranked_customers rc ON fr.film_id = rc.film_id WHERE rc.rn = 1;",
+"new_index_suggestion":"CREATE INDEX idx_film_customers_film_rental ON film_customers(film_id, rental_count);",
+"explanation":"Rewrote per-row MAX() subquery using ROW_NUMBER() window function to avoid repeated scans; added covering index to speed join."
+}}
 """
+    return prompt
+
 
 # --- (The rest of the file is unchanged from the last fix) ---
 
@@ -136,7 +202,7 @@ def generate_benchmark_queries(schema_details: str) -> List[str]:
     """
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-mini",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.0,
@@ -150,12 +216,25 @@ def generate_benchmark_queries(schema_details: str) -> List[str]:
         return []
 
 def get_ai_suggestion(schema_details: str, query: str, query_plan: dict) -> AISuggestion:
+    """
+    Returns an AI-optimized suggestion for a given PostgreSQL query.
+    Automatically detects common bottlenecks and augments the prompt.
+    """
     if not client:
         raise ConnectionError("OpenAI client not initialized. Check your API key.")
+
+    # --- Detect common patterns ---
+    patterns = detect_query_patterns(query)
+
+    # --- Construct advanced prompt ---
     prompt = construct_prompt(schema_details, query, query_plan)
+    # Include detected patterns for AI context
+    if any(patterns.values()):
+        prompt += f"\nDETECTED_PATTERNS: {patterns}"
+
     try:
         response = client.chat.completions.create(
-            model="gpt-4-turbo",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.0,
@@ -164,24 +243,26 @@ def get_ai_suggestion(schema_details: str, query: str, query_plan: dict) -> AISu
         try:
             parsed = validate_and_parse_ai_response(content)
         except ValueError:
-            # retry once with slightly higher temperature (give model another chance)
+            # Retry once with stricter instructions
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
-                messages=[{"role":"user","content": prompt + "\nRetry: output EXACT JSON object only."}],
-                response_format={"type":"json_object"},
+                messages=[{"role": "user", "content": prompt + "\nRetry: output EXACT JSON object only."}],
+                response_format={"type": "json_object"},
                 temperature=0.0,
             )
             content = response.choices[0].message.content
             parsed = validate_and_parse_ai_response(content)
 
-        # Final sanity: limit explanation length
+        # Limit explanation length
         if len(parsed.get("explanation","")) > 300:
             parsed["explanation"] = parsed["explanation"][:297] + "..."
 
         return AISuggestion(**parsed)
+
     except Exception as e:
         logger.error(f"Error in get_ai_suggestion: {e} -- raw_ai: {locals().get('content')}")
         return AISuggestion(rewritten_query=None, new_index_suggestion=None, explanation=f"AI failed: {e}")
+
 
 def calculate_cost_slayer(cost_before: float, cost_after: float, calls: int) -> CostSlayerInfo:
     cost_per_query = cost_before * 0.0001
