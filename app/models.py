@@ -1,94 +1,71 @@
 from pydantic import BaseModel
 from typing import List, Optional, Any
 
-# --- Request Models ---
+# --- Shared Models ---
 
-class AnalyzeRequest(BaseModel):
-    """
-    The request body for the main /analyze endpoint.
-    Now includes a flag for the automated health check.
-    """
-    db_uri: str
-    query_file_content: Optional[str] = None # For user-uploaded queries
-    run_automated_check: Optional[bool] = False # For AI-generated benchmark
-
-
-class DDLRequest(BaseModel):
-    """
-    The request body for /simulate and /apply endpoints.
-    It includes the DDL statement and the original query for simulation.
-    """
-    db_uri: str
-    ddl_statement: str
-    original_query: str
-
-
-class ApplyConfirmationRequest(DDLRequest):
-    """
-    Extends DDLRequest to require write credentials for the /apply endpoint.
-    This is a critical security measure.
-    """
-    write_db_uri: str
-
-
-# --- Response Models ---
+class AISuggestion(BaseModel):
+    rewritten_query: Optional[str]
+    new_index_suggestion: Optional[str]
+    explanation: str
 
 class CostSlayerInfo(BaseModel):
-    """
-    Holds the cost analysis data.
-    """
     estimated_daily_cost: float
     potential_savings_percentage: float
     cost_before: float
     cost_after: float
 
+# --- Request Models ---
 
-class AISuggestion(BaseModel):
+class AnalysisRequest(BaseModel):
     """
-    The AI's generated fix and explanation.
+    A unified request to start an analysis session.
     """
-    rewritten_query: Optional[str]
-    new_index_suggestion: Optional[str]
-    explanation: str
+    db_uri: str
+    mode: str  # "auto", "benchmark", or "file"
+    file_content: Optional[str] = None
 
-
-class PerformanceIssue(BaseModel):
+class OptimizationRequest(BaseModel):
     """
-    A single identified performance issue.
-    Now includes execution time metrics.
+    Contains all the "before" data for a single query to be optimized.
     """
-    id: int
+    db_uri: str
     query: str
-    # avg_execution_time_ms is from pg_stat_statements
-    avg_execution_time_ms: Optional[float] = None
-    # actual_execution_time_ms is from a direct EXPLAIN ANALYZE run
-    actual_execution_time_ms: Optional[float] = None
-    estimated_execution_time_after_ms: Optional[float] = None
-    calls: int
-    cost_slayer: CostSlayerInfo
-    ai_suggestion: AISuggestion
-    query_plan_before: Any # Could be JSON or text
-
-
-class AnalysisResult(BaseModel):
-    """
-    The full response for the /analyze endpoint.
-    """
-    performance_issues: List[PerformanceIssue]
-
-
-class SimulationResult(BaseModel):
-    """
-    The response for the /simulate endpoint.
-    """
     query_plan_before: Any
-    query_plan_after: Any
-    estimated_improvement_factor: float
+    # This can be optional as we may not have it for pg_stat_statements queries initially
+    execution_time_ms: Optional[float] = None
 
+class ApplyConfirmationRequest(BaseModel):
+    write_db_uri: str
+    ddl_statement: str
+
+# --- Response Models ---
+
+class Problem(BaseModel):
+    """
+    Represents a single identified problem (a slow query).
+    """
+    query: str
+    # This will be the average time from pg_stat or the actual time from a benchmark
+    execution_time_ms: Optional[float] = None
+    query_plan_before: Optional[Any] = None
+    calls: Optional[int] = None # Only available for pg_stat_statements
+    error: Optional[str] = None
+
+class AnalysisSessionResult(BaseModel):
+    """
+    The result of starting an analysis session.
+    """
+    source: str # "pg_stat_statements", "automated_benchmark", "user_file", "empty"
+    problems: List[Problem]
+
+class OptimizationResult(BaseModel):
+    """
+    The optimization details for a single query (the "solution").
+    """
+    ai_suggestion: AISuggestion
+    cost_slayer: CostSlayerInfo
+    estimated_execution_time_after_ms: Optional[float] = None
 
 class ApplyResult(BaseModel):
-    """
-    The response for the /apply endpoint.
-    """
     success: bool
     message: str

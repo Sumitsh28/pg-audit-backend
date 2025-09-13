@@ -6,10 +6,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def get_engine(db_uri: str):
-    """Creates and returns a SQLAlchemy engine."""
+    # ... (unchanged)
     try:
         engine = create_engine(db_uri, pool_pre_ping=True)
-        # Test connection
         with engine.connect() as connection:
             logger.info("Database connection successful.")
         return engine
@@ -18,20 +17,8 @@ def get_engine(db_uri: str):
         raise
 
 def get_pg_stat_statements(engine):
-    """
-    Fetches query performance data from the pg_stat_statements view.
-    Returns a list of query data or None if the view is not available or empty.
-    """
-    query = text("""
-        SELECT
-            query,
-            calls,
-            total_exec_time,
-            mean_exec_time
-        FROM pg_stat_statements
-        ORDER BY mean_exec_time DESC
-        LIMIT 10;
-    """)
+    # ... (unchanged)
+    query = text("SELECT query, calls, total_exec_time, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;")
     try:
         with engine.connect() as connection:
             result = connection.execute(query).fetchall()
@@ -46,31 +33,36 @@ def get_pg_stat_statements(engine):
         logger.error(f"Error fetching from pg_stat_statements: {e}")
         raise
 
+# --- MODIFIED FUNCTION ---
 def get_schema_details(engine):
     """
-    Introspects the database to get CREATE TABLE and CREATE INDEX statements.
-    This provides crucial context for the AI.
+    Introspects the database to get CREATE TABLE, CREATE VIEW, and CREATE INDEX statements.
     """
     schema_info = ""
+    # Query for Tables
     query_tables = text("""
-        SELECT 'CREATE TABLE ' || table_name || ' (' ||
-               string_agg(column_name || ' ' || data_type, ', ') ||
-               ');' as create_statement
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-        GROUP BY table_name;
+        SELECT 'CREATE TABLE ' || table_name || ' (' || string_agg(column_name || ' ' || data_type, ', ') || ');' as create_statement
+        FROM information_schema.columns WHERE table_schema = 'public' GROUP BY table_name;
     """)
-    query_indexes = text("""
-        SELECT indexdef as create_statement
-        FROM pg_indexes
-        WHERE schemaname = 'public';
+    # Query for Views
+    query_views = text("""
+        SELECT 'CREATE VIEW ' || table_name || ' AS ' || view_definition || ';' as create_statement
+        FROM information_schema.views WHERE table_schema = 'public';
     """)
+    # Query for Indexes
+    query_indexes = text("SELECT indexdef as create_statement FROM pg_indexes WHERE schemaname = 'public';")
+    
     try:
         with engine.connect() as connection:
+            # Add table info
             tables = connection.execute(query_tables).fetchall()
             for table in tables:
                 schema_info += table[0] + "\n\n"
-            
+            # Add view info
+            views = connection.execute(query_views).fetchall()
+            for view in views:
+                schema_info += view[0] + "\n\n"
+            # Add index info
             indexes = connection.execute(query_indexes).fetchall()
             for index in indexes:
                 schema_info += index[0] + ";\n"
@@ -78,70 +70,76 @@ def get_schema_details(engine):
     except Exception as e:
         logger.error(f"Error fetching schema details: {e}")
         raise
+# --- END MODIFIED FUNCTION ---
 
-def get_query_plan(engine, query: str):
+# --- MODIFIED FUNCTION ---
+def get_query_plan(db_connection_or_engine, query: str):
     """
-    Runs EXPLAIN (FORMAT JSON) on a given query to get its execution plan.
-    Does NOT execute the query.
+    Runs EXPLAIN (FORMAT JSON) and returns the plan OBJECT, not the list.
     """
     explain_query = text(f"EXPLAIN (FORMAT JSON) {query}")
     try:
-        with engine.connect() as connection:
-            result = connection.execute(explain_query).scalar_one()
-            return result
+        if isinstance(db_connection_or_engine, sqlalchemy.engine.base.Engine):
+            with db_connection_or_engine.connect() as connection:
+                result = connection.execute(explain_query).scalar_one()
+        else: # It's a connection object
+            result = db_connection_or_engine.execute(explain_query).scalar_one()
+        
+        # FIX: Always return the plan object inside the list
+        return result[0].get("Plan") if result else None
     except Exception as e:
         logger.error(f"Error getting query plan for '{query}': {e}")
         return {"error": str(e)}
+# --- END MODIFIED FUNCTION ---
 
-# --- NEW FUNCTION ---
 def get_query_plan_and_execution_time(engine, query: str):
-    """
-    Runs EXPLAIN (ANALYZE, FORMAT JSON) to get the plan and actual execution time.
-    This is for benchmark/user-submitted queries.
-    Returns a tuple: (plan, execution_time_ms)
-    """
+    # ... (unchanged)
     explain_query = text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query}")
     try:
         with engine.connect() as connection:
-            # The result is a list with a single JSON object
             result_json = connection.execute(explain_query).scalar_one()
-            
-            # Extract the plan and the execution time
             plan = result_json[0].get("Plan")
             execution_time = result_json[0].get("Execution Time")
-            
             return plan, execution_time
     except Exception as e:
         logger.error(f"Error getting analyzed query plan for '{query}': {e}")
-        # Propagate the error to be handled by the main endpoint
         raise e
-# --- END NEW FUNCTION ---
 
 def simulate_ddl(engine, ddl_statement: str, original_query: str):
     """
-    Safely simulates a DDL change by running it in a transaction
-    that is immediately rolled back. It returns the new query plan.
+    Apply DDL in a transaction, run EXPLAIN (ANALYZE, FORMAT JSON) on original_query,
+    capture plan + Execution Time + Total Cost, then rollback.
+    Returns dict: {"plan": plan_obj, "execution_time_ms": exec_time, "total_cost": total_cost}
     """
     try:
         with engine.connect() as connection:
             with connection.begin() as transaction:
+                # Apply DDL
                 connection.execute(text(ddl_statement))
-                
-                # Use the non-analyzing get_query_plan for simulation
-                plan_after = get_query_plan(connection, original_query)
-                
-                transaction.rollback() # CRITICAL: This undoes the DDL
-                logger.info("DDL simulation successful and rolled back.")
-                return plan_after
+                # Optionally force planner refresh - often not needed but harmless:
+                # connection.execute(text("DISCARD PLANS;"))
+                explain_q = text(f"EXPLAIN (ANALYZE, FORMAT JSON) {original_query}")
+                result_json = connection.execute(explain_q).scalar_one()
+                # result_json is typically a list like: [ { "Plan": {...}, "Execution Time": N } ]
+                plan_obj = None
+                exec_time = None
+                total_cost = None
+                if isinstance(result_json, (list, tuple)) and len(result_json) > 0:
+                    root = result_json[0]
+                    plan_obj = root.get("Plan")
+                    exec_time = root.get("Execution Time")
+                    if plan_obj:
+                        # plan_obj Total Cost might live in root or inside Plan node
+                        total_cost = plan_obj.get("Total Cost") or root.get("Total Cost")
+                # rollback
+                transaction.rollback()
+                return {"plan": plan_obj, "execution_time_ms": exec_time, "total_cost": total_cost}
     except Exception as e:
         logger.error(f"Error during DDL simulation: {e}")
         raise
 
 def apply_ddl(write_db_uri: str, ddl_statement: str):
-    """
-    Connects with write permissions and applies a DDL statement.
-    THIS IS A DESTRUCTIVE OPERATION.
-    """
+    # ... (unchanged)
     write_engine = get_engine(write_db_uri)
     try:
         with write_engine.connect() as connection:
