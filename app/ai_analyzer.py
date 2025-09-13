@@ -6,9 +6,9 @@ from dotenv import load_dotenv
 from typing import List
 
 import re
-from typing import List, Dict
+from typing import List, Dict,  Optional
 
-from .models import AISuggestion, CostSlayerInfo
+from .models import AISuggestion, CostSlayerInfo, Problem, OptimizationResult, ChatMessage 
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -35,22 +35,18 @@ def detect_query_patterns(query: str) -> Dict[str, List[str]]:
         "aggregations_no_filter": [],
     }
 
-    # Detect MAX()/MIN() in WHERE or SELECT as a subquery
     max_min_matches = re.findall(r"\(\s*SELECT\s+(MAX|MIN)\([^\)]+\).*?\)", query, flags=re.IGNORECASE | re.DOTALL)
     if max_min_matches:
         patterns["max_min_subqueries"].extend(max_min_matches)
 
-    # Detect IN (SELECT ...) subqueries
     in_matches = re.findall(r"IN\s*\(\s*SELECT[^\)]+\)", query, flags=re.IGNORECASE | re.DOTALL)
     if in_matches:
         patterns["nested_in_subqueries"].extend(in_matches)
 
-    # Detect OR conditions in WHERE clauses
     or_matches = re.findall(r"\bWHERE\b.*\bOR\b.*", query, flags=re.IGNORECASE | re.DOTALL)
     if or_matches:
         patterns["or_conditions"].extend(or_matches)
 
-    # Detect aggregations without filters
     agg_matches = re.findall(r"SELECT\s+.*\b(COUNT|SUM|AVG|MIN|MAX)\(", query, flags=re.IGNORECASE)
     if agg_matches and "WHERE" not in query.upper():
         patterns["aggregations_no_filter"].extend(agg_matches)
@@ -64,7 +60,7 @@ def is_safe_create_index(stmt: str) -> bool:
     """
     if not stmt or not isinstance(stmt, str):
         return False
-    s = stmt.strip().rstrip(';')  # allow trailing semicolon or not
+    s = stmt.strip().rstrip(';')  
     pattern = r'(?i)^CREATE\s+INDEX\s+[A-Za-z0-9_]+\s+ON\s+[A-Za-z0-9_]+\s*\(\s*[A-Za-z0-9_]+(?:\s*,\s*[A-Za-z0-9_]+)*\s*\)\s*$'
     return re.match(pattern, s) is not None
 
@@ -77,17 +73,17 @@ def validate_and_parse_ai_response(raw: str, required_keys=("rewritten_query","n
     if not raw or not isinstance(raw, str):
         raise ValueError("Empty or invalid raw response")
 
-    # Quick trim
+    
     s = raw.strip()
 
-    # 1) If it is valid JSON at top-level, try parsing
+   
     try:
         obj = json.loads(s)
     except Exception:
-        # 2) Otherwise try to extract the first {...} block
+       
         m = re.search(r'(\{(?:[^{}]|(?R))*\})', s, flags=re.DOTALL)
         if not m:
-            # fallback: try to find a substring starting with { and ending with }
+            
             m2 = re.search(r'(\{.*\})', s, flags=re.DOTALL)
             if not m2:
                 raise ValueError("Could not find JSON object in AI response")
@@ -99,14 +95,14 @@ def validate_and_parse_ai_response(raw: str, required_keys=("rewritten_query","n
         except Exception as e:
             raise ValueError(f"Failed to parse extracted JSON: {e} -- raw snippet: {raw_json[:200]}")
 
-    # 3) Validate required keys exist and types are sane
+    
     for k in required_keys:
         if k not in obj:
             raise ValueError(f"Missing required key in AI response: {k}")
         if obj[k] is not None and not isinstance(obj[k], str):
             raise ValueError(f"Key {k} must be a string or null")
 
-    # 4) Normalize empty strings to null for rewrites/index suggestions
+   
     for k in ("rewritten_query","new_index_suggestion"):
         if obj.get(k) is not None and obj[k].strip() == "":
             obj[k] = None
@@ -175,7 +171,6 @@ Optimized output:
     return prompt
 
 
-# --- (The rest of the file is unchanged from the last fix) ---
 
 def generate_benchmark_queries(schema_details: str) -> List[str]:
     """
@@ -223,12 +218,9 @@ def get_ai_suggestion(schema_details: str, query: str, query_plan: dict) -> AISu
     if not client:
         raise ConnectionError("OpenAI client not initialized. Check your API key.")
 
-    # --- Detect common patterns ---
     patterns = detect_query_patterns(query)
 
-    # --- Construct advanced prompt ---
     prompt = construct_prompt(schema_details, query, query_plan)
-    # Include detected patterns for AI context
     if any(patterns.values()):
         prompt += f"\nDETECTED_PATTERNS: {patterns}"
 
@@ -243,7 +235,6 @@ def get_ai_suggestion(schema_details: str, query: str, query_plan: dict) -> AISu
         try:
             parsed = validate_and_parse_ai_response(content)
         except ValueError:
-            # Retry once with stricter instructions
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt + "\nRetry: output EXACT JSON object only."}],
@@ -253,7 +244,6 @@ def get_ai_suggestion(schema_details: str, query: str, query_plan: dict) -> AISu
             content = response.choices[0].message.content
             parsed = validate_and_parse_ai_response(content)
 
-        # Limit explanation length
         if len(parsed.get("explanation","")) > 300:
             parsed["explanation"] = parsed["explanation"][:297] + "..."
 
@@ -276,3 +266,98 @@ def calculate_cost_slayer(cost_before: float, cost_after: float, calls: int) -> 
         cost_before=round(cost_before, 2),
         cost_after=round(cost_after, 2)
     )
+    
+def get_rag_chat_response(
+    schema_details: str,
+    query_context,  
+    optimization_context: Optional[object],  
+    chat_history: List[object],  
+    user_question: str
+) -> str:
+    """
+    Generates a response for a chatbot using a RAG pattern.
+    The context is built from the provided schema, query, plan, and optimization.
+    """
+    if not client:
+        raise ConnectionError("OpenAI client not initialized.")
+
+    parts: List[str] = []
+    parts.append("--- CONTEXT DOCUMENT START ---\n")
+    parts.append(
+        "You are a helpful AI assistant for a PostgreSQL optimization tool. "
+        "Your task is to answer questions about a specific SQL query and its performance analysis.\n\n"
+        "You MUST strictly base your answers on the context provided below.\n"
+        "If the user's question cannot be answered using this context, state that you do not have enough information from the provided context.\n"
+        "Do not answer questions unrelated to this specific query. Do not suggest optimizations not mentioned in the context.\n"
+    )
+
+    parts.append("**Database Schema:**\n")
+    parts.append(f"{schema_details}\n")
+
+    parts.append("**Query Under Discussion:**\n")
+    parts.append("```sql\n")
+    parts.append(f"{query_context.query}\n")
+    parts.append("```\n\n")
+
+    parts.append("Performance Analysis (Before Optimization):\n\n")
+    parts.append(f"Execution Time: {query_context.execution_time_ms:.2f} ms\n")
+    parts.append(f"Number of Calls: {query_context.calls}\n\n")
+    parts.append("Query Plan (Before):\n")
+    
+    try:
+        parts.append(json.dumps(query_context.query_plan_before, indent=2) + "\n")
+    except Exception:
+        parts.append("No query plan available or failed to serialize.\n")
+
+    if optimization_context:
+        ai_sugg = getattr(optimization_context, "ai_suggestion", None)
+        cost_slayer = getattr(optimization_context, "cost_slayer", None)
+        parts.append("\nAI-Powered Optimization Suggestion:\n\n")
+        if ai_sugg:
+            parts.append(f"Rewritten Query: {ai_sugg.rewritten_query or 'No rewrite suggested.'}\n\n")
+            parts.append(f"New Index Suggestion: {ai_sugg.new_index_suggestion or 'No index suggested.'}\n\n")
+            parts.append(f"Explanation for Suggestion: {ai_sugg.explanation or 'No explanation provided.'}\n\n")
+        else:
+            parts.append("- No AI suggestion object available.\n\n")
+
+        if cost_slayer:
+            parts.append("Estimated Performance (After Optimization):\n\n")
+            parts.append(f"Cost (Before): {getattr(cost_slayer, 'cost_before', 'N/A')}\n")
+            parts.append(f"Cost (After): {getattr(cost_slayer, 'cost_after', 'N/A')}\n")
+        else:
+            parts.append("- No cost slayer information available.\n")
+
+        est_time = getattr(optimization_context, "estimated_execution_time_after_ms", None)
+        parts.append(f"Estimated Execution Time: {(est_time or 0):.2f} ms\n")
+    else:
+        parts.append("\nAI-Powered Optimization Suggestion:\n")
+        parts.append("- The 'Optimize' function has not been run for this query yet.\n")
+
+    parts.append("\n--- CONTEXT DOCUMENT END ---\n")
+
+    context_doc = "".join(parts)
+
+    messages_for_api = [{"role": "system", "content": context_doc}]
+    for msg in chat_history:
+        messages_for_api.append({"role": msg.role, "content": msg.content})
+    messages_for_api.append({"role": "user", "content": user_question})
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=messages_for_api,
+            temperature=0.1,
+        )
+       
+        try:
+            return response.choices[0].message.content
+        except Exception:
+           
+            try:
+                return response.choices[0].text
+            except Exception:
+                logger.error("Unexpected response format from OpenAI: %s", response)
+                return "Sorry, I received an unexpected response format from the AI."
+    except Exception as e:
+        logger.error(f"Error getting RAG chat response from OpenAI: {e}")
+        return "Sorry, I encountered an error while processing your question."

@@ -69,3 +69,17 @@ class OptimizationResult(BaseModel):
 class ApplyResult(BaseModel):
     success: bool
     message: str
+    
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatOnQueryRequest(BaseModel):
+    db_uri: str
+    query_context: "Problem"  
+    optimization_context: Optional["OptimizationResult"] = None
+    chat_history: List[ChatMessage]
+    user_question: str
+
+class ChatResponse(BaseModel):
+    response: str

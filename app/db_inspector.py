@@ -6,7 +6,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def get_engine(db_uri: str):
-    # ... (unchanged)
+  
     try:
         engine = create_engine(db_uri, pool_pre_ping=True)
         with engine.connect() as connection:
@@ -17,7 +17,7 @@ def get_engine(db_uri: str):
         raise
 
 def get_pg_stat_statements(engine):
-    # ... (unchanged)
+    
     query = text("SELECT query, calls, total_exec_time, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;")
     try:
         with engine.connect() as connection:
@@ -33,36 +33,35 @@ def get_pg_stat_statements(engine):
         logger.error(f"Error fetching from pg_stat_statements: {e}")
         raise
 
-# --- MODIFIED FUNCTION ---
 def get_schema_details(engine):
     """
     Introspects the database to get CREATE TABLE, CREATE VIEW, and CREATE INDEX statements.
     """
     schema_info = ""
-    # Query for Tables
+   
     query_tables = text("""
         SELECT 'CREATE TABLE ' || table_name || ' (' || string_agg(column_name || ' ' || data_type, ', ') || ');' as create_statement
         FROM information_schema.columns WHERE table_schema = 'public' GROUP BY table_name;
     """)
-    # Query for Views
+    
     query_views = text("""
         SELECT 'CREATE VIEW ' || table_name || ' AS ' || view_definition || ';' as create_statement
         FROM information_schema.views WHERE table_schema = 'public';
     """)
-    # Query for Indexes
+    
     query_indexes = text("SELECT indexdef as create_statement FROM pg_indexes WHERE schemaname = 'public';")
     
     try:
         with engine.connect() as connection:
-            # Add table info
+            
             tables = connection.execute(query_tables).fetchall()
             for table in tables:
                 schema_info += table[0] + "\n\n"
-            # Add view info
+            
             views = connection.execute(query_views).fetchall()
             for view in views:
                 schema_info += view[0] + "\n\n"
-            # Add index info
+            
             indexes = connection.execute(query_indexes).fetchall()
             for index in indexes:
                 schema_info += index[0] + ";\n"
@@ -70,9 +69,7 @@ def get_schema_details(engine):
     except Exception as e:
         logger.error(f"Error fetching schema details: {e}")
         raise
-# --- END MODIFIED FUNCTION ---
 
-# --- MODIFIED FUNCTION ---
 def get_query_plan(db_connection_or_engine, query: str):
     """
     Runs EXPLAIN (FORMAT JSON) and returns the plan OBJECT, not the list.
@@ -82,18 +79,16 @@ def get_query_plan(db_connection_or_engine, query: str):
         if isinstance(db_connection_or_engine, sqlalchemy.engine.base.Engine):
             with db_connection_or_engine.connect() as connection:
                 result = connection.execute(explain_query).scalar_one()
-        else: # It's a connection object
+        else: 
             result = db_connection_or_engine.execute(explain_query).scalar_one()
         
-        # FIX: Always return the plan object inside the list
         return result[0].get("Plan") if result else None
     except Exception as e:
         logger.error(f"Error getting query plan for '{query}': {e}")
         return {"error": str(e)}
-# --- END MODIFIED FUNCTION ---
 
 def get_query_plan_and_execution_time(engine, query: str):
-    # ... (unchanged)
+   
     explain_query = text(f"EXPLAIN (ANALYZE, FORMAT JSON) {query}")
     try:
         with engine.connect() as connection:
@@ -114,13 +109,11 @@ def simulate_ddl(engine, ddl_statement: str, original_query: str):
     try:
         with engine.connect() as connection:
             with connection.begin() as transaction:
-                # Apply DDL
+                
                 connection.execute(text(ddl_statement))
-                # Optionally force planner refresh - often not needed but harmless:
-                # connection.execute(text("DISCARD PLANS;"))
+               
                 explain_q = text(f"EXPLAIN (ANALYZE, FORMAT JSON) {original_query}")
                 result_json = connection.execute(explain_q).scalar_one()
-                # result_json is typically a list like: [ { "Plan": {...}, "Execution Time": N } ]
                 plan_obj = None
                 exec_time = None
                 total_cost = None
@@ -129,9 +122,8 @@ def simulate_ddl(engine, ddl_statement: str, original_query: str):
                     plan_obj = root.get("Plan")
                     exec_time = root.get("Execution Time")
                     if plan_obj:
-                        # plan_obj Total Cost might live in root or inside Plan node
                         total_cost = plan_obj.get("Total Cost") or root.get("Total Cost")
-                # rollback
+             
                 transaction.rollback()
                 return {"plan": plan_obj, "execution_time_ms": exec_time, "total_cost": total_cost}
     except Exception as e:
@@ -139,7 +131,6 @@ def simulate_ddl(engine, ddl_statement: str, original_query: str):
         raise
 
 def apply_ddl(write_db_uri: str, ddl_statement: str):
-    # ... (unchanged)
     write_engine = get_engine(write_db_uri)
     try:
         with write_engine.connect() as connection:

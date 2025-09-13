@@ -3,12 +3,16 @@ import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import json
+from pydantic import BaseModel, Field
 
 from . import db_inspector, ai_analyzer
 from .models import (
     AnalysisRequest, OptimizationRequest, ApplyConfirmationRequest,
-    AnalysisSessionResult, Problem, OptimizationResult, ApplyResult
+    AnalysisSessionResult, Problem, OptimizationResult, ApplyResult,
+    ChatMessage, ChatOnQueryRequest, ChatResponse 
 )
+
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,7 +20,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="PostgreSQL AI Optimizer API",
     description="API for analyzing and optimizing PostgreSQL databases.",
-    version="2.0.0" # Version bump for unified workflow
+    version="2.0.0" 
 )
 
 app.add_middleware(
@@ -30,7 +34,6 @@ def parse_queries_from_file(content: str) -> list[str]:
     queries = [query.strip() for query in content.split(';') if query.strip()]
     return queries
 
-# --- NEW UNIFIED "STEP 1" ENDPOINT ---
 @app.post("/start-analysis-session", response_model=AnalysisSessionResult)
 async def start_analysis_session(request: AnalysisRequest):
     """
@@ -48,7 +51,6 @@ async def start_analysis_session(request: AnalysisRequest):
     source = "empty"
     problems = []
     
-    # --- Mode: auto (Check pg_stat_statements) ---
     if request.mode == "auto":
         pg_stats = db_inspector.get_pg_stat_statements(engine)
         if pg_stats:
@@ -59,7 +61,6 @@ async def start_analysis_session(request: AnalysisRequest):
                 plan = db_inspector.get_query_plan(engine, query)
                 problems.append(Problem(query=query, execution_time_ms=mean_time, query_plan_before=plan, calls=calls))
     
-    # --- Mode: benchmark (AI Health Check) ---
     elif request.mode == "benchmark":
         logger.info("Running Automated Health Check.")
         source = "automated_benchmark"
@@ -71,7 +72,6 @@ async def start_analysis_session(request: AnalysisRequest):
             except Exception as e:
                 problems.append(Problem(query=query, error=f"Execution failed: {e}"))
     
-    # --- Mode: file (User Upload) ---
     elif request.mode == "file" and request.file_content:
         logger.info("Analyzing queries from user-provided file.")
         source = "user_file"
@@ -85,7 +85,6 @@ async def start_analysis_session(request: AnalysisRequest):
     
     return AnalysisSessionResult(source=source, problems=problems)
 
-# --- UNCHANGED "STEP 2" ENDPOINT ---
 @app.post("/get-optimization-suggestion", response_model=OptimizationResult)
 async def get_optimization_suggestion(request: OptimizationRequest):
     try:
@@ -94,12 +93,10 @@ async def get_optimization_suggestion(request: OptimizationRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Database connection failed: {e}")
 
-    # --- Get AI suggestion ---
     ai_suggestion = ai_analyzer.get_ai_suggestion(schema_details, request.query, request.query_plan_before or {})
     ddl_statement = ai_suggestion.new_index_suggestion
     rewritten = ai_suggestion.rewritten_query
 
-    # --- Pretty-print inputs to terminal & logs ---
     print("\n=== OPTIMIZER: ANALYSIS START ===")
     print("Original query:")
     print(request.query)
@@ -116,14 +113,12 @@ async def get_optimization_suggestion(request: OptimizationRequest):
     logger.info("AI suggestion: rewritten=%s index=%s explanation=%s",
                 rewritten, ddl_statement, ai_suggestion.explanation)
 
-    # --- Prepare before/after cost/time tracking ---
     cost_before = 0
     if isinstance(request.query_plan_before, dict):
         cost_before = request.query_plan_before.get("Total Cost", 0)
     cost_after = cost_before
     execution_time_after = None
 
-    # --- If AI suggested an index: validate & simulate DDL, then print results ---
     if ddl_statement:
         is_safe = getattr(ai_analyzer, "is_safe_create_index", lambda s: False)
         if not is_safe(ddl_statement):
@@ -135,7 +130,6 @@ async def get_optimization_suggestion(request: OptimizationRequest):
                 print("\nApplying simulated DDL and running EXPLAIN ANALYZE (in transaction)...")
                 sim = db_inspector.simulate_ddl(engine, ddl_statement, request.query)
                 if sim:
-                    # plan after may be nested dict
                     cost_after = sim.get("total_cost") or cost_before
                     execution_time_after = sim.get("execution_time_ms")
                     print("\n--- SIMULATION RESULT (AFTER DDL) ---")
@@ -152,7 +146,6 @@ async def get_optimization_suggestion(request: OptimizationRequest):
                 logger.warning("simulate_ddl failed: %s", e)
                 print(f"\nSimulation failed: {e}")
 
-    # --- Else if AI provided a rewritten query: run EXPLAIN ANALYZE & print ---
     elif rewritten:
         try:
             print("\nRunning EXPLAIN (ANALYZE, FORMAT JSON) on rewritten query...")
@@ -177,7 +170,6 @@ async def get_optimization_suggestion(request: OptimizationRequest):
             logger.warning("Could not ANALYZE rewritten query: %s", e)
             print(f"\nCould not ANALYZE rewritten query: {e}")
 
-    # --- Compute cost info and estimated execution time ---
     cost_info = ai_analyzer.calculate_cost_slayer(cost_before, cost_after, calls=1)
     est_exec_time_after = None
     if execution_time_after is not None:
@@ -186,7 +178,6 @@ async def get_optimization_suggestion(request: OptimizationRequest):
         improvement_factor = cost_before / cost_after if cost_after > 0 else 1.0
         est_exec_time_after = request.execution_time_ms / improvement_factor
 
-    # --- Final prints & logs summarizing results ---
     print("\n=== SUMMARY ===")
     print("Total Cost (before):", cost_before)
     print("Total Cost (after):", cost_after)
@@ -206,14 +197,11 @@ async def get_optimization_suggestion(request: OptimizationRequest):
     )
 
 
-# --- UNCHANGED "APPLY" ENDPOINT ---
 @app.post("/apply", response_model=ApplyResult)
 async def apply_fix(request: ApplyConfirmationRequest):
-    # This endpoint is also fine as is.
-    # NOTE: The frontend will need to be updated to pass the correct request body.
+   
     try:
-        # In a real app, you would not pass the write URI from the client.
-        # This is simplified for demonstration.
+        
         write_db_uri = request.write_db_uri
         success, message = db_inspector.apply_ddl(write_db_uri, request.ddl_statement)
         if not success:
@@ -224,4 +212,26 @@ async def apply_fix(request: ApplyConfirmationRequest):
     
     
     
+@app.post("/chat-on-query", response_model=ChatResponse)
+async def chat_on_query(request: ChatOnQueryRequest):
+    """
+    Handles a RAG-based chat conversation about a specific query.
+    """
+    try:
+        engine = db_inspector.get_engine(request.db_uri)
+        schema_details = db_inspector.get_schema_details(engine)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Database connection failed: {e}")
 
+    try:
+        ai_response = ai_analyzer.get_rag_chat_response(
+            schema_details=schema_details,
+            query_context=request.query_context,
+            optimization_context=request.optimization_context,
+            chat_history=request.chat_history,
+            user_question=request.user_question
+        )
+        return ChatResponse(response=ai_response)
+    except Exception as e:
+        logger.error(f"Error during RAG chat: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing chat request: {e}")
