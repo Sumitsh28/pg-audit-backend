@@ -223,14 +223,15 @@ def generate_benchmark_queries(dialect: str, schema_details: str) -> List[str]:
 
     Rules for query generation:
     1.  Queries must be realistic and designed to find performance bottlenecks (e.g., using JOINs, aggregations, filtering on non-indexed columns).
-    2.  **CRITICAL DATA TYPE RULE:** Pay very close attention to column data types. When creating `JOIN` conditions, you **MUST** ensure the columns being compared have compatible data types.
-    3.  **CRITICAL SAFETY RULE:** All queries **MUST** be READ-ONLY (`SELECT` statements only) and syntactically correct for {dialect_name}.
-    4.  Format your response as a single, minified JSON object with one key: "queries", which is an array of SQL query strings.
+    2.  **CRITICAL JOIN RULE:** You MUST inspect the `CREATE TABLE` statements to find the correct columns for JOINs. Do not invent column names. For example, to get a country name from a city, you must join `city` with `country` on `city.country_id = country.country_id`.
+    3.  **CRITICAL DATA TYPE RULE:** Pay very close attention to column data types. When creating `JOIN` conditions, you **MUST** ensure the columns being compared have compatible data types.
+    4.  **CRITICAL SAFETY RULE:** All queries **MUST** be READ-ONLY (`SELECT` statements only) and syntactically correct for {dialect_name}.
+    5.  Format your response as a single, minified JSON object with one key: "queries", which is an array of SQL query strings.
     Example Response: {{"queries": ["SELECT ...", "SELECT ..."]}}
     """
     try:
         response = client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             
@@ -254,7 +255,7 @@ def get_ai_suggestion(dialect: str, schema_details: str, query: str, query_plan:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
@@ -367,7 +368,7 @@ def get_rag_chat_response(
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-3.5-turbo",
             messages=messages_for_api,
             
         )
