@@ -227,7 +227,7 @@ def get_ai_suggestion(schema_details: str, query: str, query_plan: dict, executi
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4-turbo", # Using a stronger model can improve estimation quality
+            model="gpt-3.5-turbo", # Using a stronger model can improve estimation quality
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.0,
@@ -355,7 +355,7 @@ def get_rag_chat_response(
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4-turbo",
+            model="gpt-3.5-turbo",
             messages=messages_for_api,
             temperature=0.1,
         )

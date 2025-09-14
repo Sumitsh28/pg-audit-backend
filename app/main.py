@@ -9,7 +9,8 @@ from . import db_inspector, ai_analyzer
 from .models import (
     AnalysisRequest, OptimizationRequest, ApplyConfirmationRequest,
     AnalysisSessionResult, Problem, OptimizationResult, ApplyResult,
-    ChatMessage, ChatOnQueryRequest, ChatResponse
+    ChatMessage, ChatOnQueryRequest, ChatResponse,
+    SandboxRequest, SandboxResult
 )
 
 
@@ -204,3 +205,38 @@ async def chat_on_query(request: ChatOnQueryRequest):
     except Exception as e:
         logger.error(f"Error during RAG chat: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing chat request: {e}")
+
+@app.post("/verify-queries", response_model=SandboxResult)
+async def verify_queries(request: SandboxRequest):
+    """
+    Executes the original and optimized queries with a LIMIT 20 clause
+    and compares their results to verify correctness.
+    """
+    try:
+        engine = db_inspector.get_engine(request.db_uri)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Database connection failed: {e}")
+
+    # The actual logic will be in a new function in db_inspector
+    try:
+        match, original_results, optimized_results, error_message = db_inspector.verify_queries_match(
+            engine=engine,
+            original_query=request.original_query,
+            optimized_query=request.optimized_query
+        )
+        
+        return SandboxResult(
+            match=match,
+            original_query_results=original_results,
+            optimized_query_results=optimized_results,
+            error=error_message
+        )
+    except Exception as e:
+        logger.error(f"Error during query verification: {e}", exc_info=True)
+        # Return a structured error in the response body
+        return SandboxResult(
+            match=False,
+            original_query_results=[],
+            optimized_query_results=[],
+            error=f"An unexpected server error occurred: {e}"
+        )

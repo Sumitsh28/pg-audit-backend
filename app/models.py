@@ -83,3 +83,16 @@ class ChatOnQueryRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    
+class SandboxRequest(BaseModel):
+    """Request to the /verify-queries endpoint."""
+    db_uri: str
+    original_query: str
+    optimized_query: Optional[str] = None
+
+class SandboxResult(BaseModel):
+    """Response from the /verify-queries endpoint."""
+    match: bool
+    original_query_results: List[Dict[str, Any]]
+    optimized_query_results: List[Dict[str, Any]]
+    error: Optional[str] = None

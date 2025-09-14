@@ -2,6 +2,10 @@ import sqlalchemy
 from sqlalchemy import create_engine, text
 import logging
 
+import re
+
+from typing import List, Dict, Any, Tuple
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -144,3 +148,78 @@ def apply_ddl(write_db_uri: str, ddl_statement: str):
     except Exception as e:
         logger.error(f"Failed to apply DDL: {e}")
         return False, f"Failed to apply fix: {e}"
+    
+def _clean_and_limit_query(query: str, limit: int = 20) -> str:
+    """A helper to safely remove trailing semicolons and add a LIMIT clause."""
+    query = query.strip().rstrip(';')
+    # Use regex to avoid adding a second LIMIT clause
+    if not re.search(r'\blimit\s+\d+\s*$', query, re.IGNORECASE):
+        query = f"{query} LIMIT {limit}"
+    return query
+
+def _normalize_results(results: List[Dict]) -> List[Tuple]:
+    """Converts a list of dicts for order-independent comparison."""
+    if not results:
+        return []
+    # Creates a sorted list of sorted tuples of items, making comparison deterministic
+    normalized = [tuple(sorted(row.items())) for row in results]
+    return sorted(normalized)
+
+def verify_queries_match(engine, original_query: str, optimized_query: str) -> Tuple[bool, List[Dict], List[Dict], str]:
+    """
+    Executes two queries with a LIMIT 20, converts results to a list of dicts,
+    and checks if the contents are identical, ignoring row and column order.
+    """
+    original_results: List[Dict] = []
+    optimized_results: List[Dict] = []
+    error_message: str = None
+    
+    # If there's no rewritten query, the results are inherently the same.
+    # We set them as equal so we only need to execute one for the preview.
+    if not optimized_query or original_query.strip() == optimized_query.strip():
+        optimized_query = original_query
+        
+    original_query_limited = _clean_and_limit_query(original_query)
+    optimized_query_limited = _clean_and_limit_query(optimized_query)
+
+    try:
+        with engine.connect() as connection:
+            # Execute original query
+            try:
+                res_orig = connection.execute(text(original_query_limited))
+                keys_orig = res_orig.keys()
+                original_results = [dict(zip(keys_orig, row)) for row in res_orig.fetchall()]
+            except Exception as e:
+                error_message = f"Error executing original query: {e}"
+                return False, [], [], error_message
+
+            # Execute optimized query only if it's different
+            if original_query_limited != optimized_query_limited:
+                try:
+                    res_opt = connection.execute(text(optimized_query_limited))
+                    keys_opt = res_opt.keys()
+                    optimized_results = [dict(zip(keys_opt, row)) for row in res_opt.fetchall()]
+                except Exception as e:
+                    error_message = f"Error executing optimized query: {e}"
+                    return False, original_results, [], error_message
+            else:
+                optimized_results = original_results
+
+        # Compare results
+        normalized_orig = _normalize_results(original_results)
+        normalized_opt = _normalize_results(optimized_results)
+        
+        if normalized_orig == normalized_opt:
+            match = True
+        else:
+            match = False
+            if original_results and optimized_results:
+                if list(original_results[0].keys()) != list(optimized_results[0].keys()):
+                    error_message = "Result columns do not match in name or order."
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in verify_queries_match: {e}", exc_info=True)
+        error_message = f"An unexpected error occurred: {e}"
+        return False, original_results, optimized_results, error_message
+
+    return match, original_results, optimized_results, error_message
