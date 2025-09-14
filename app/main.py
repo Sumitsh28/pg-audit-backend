@@ -9,7 +9,7 @@ from . import db_inspector, ai_analyzer
 from .models import (
     AnalysisRequest, OptimizationRequest, ApplyConfirmationRequest,
     AnalysisSessionResult, Problem, OptimizationResult, ApplyResult,
-    ChatMessage, ChatOnQueryRequest, ChatResponse 
+    ChatMessage, ChatOnQueryRequest, ChatResponse
 )
 
 
@@ -93,7 +93,14 @@ async def get_optimization_suggestion(request: OptimizationRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Database connection failed: {e}")
 
-    ai_suggestion = ai_analyzer.get_ai_suggestion(schema_details, request.query, request.query_plan_before or {})
+    ai_suggestion = ai_analyzer.get_ai_suggestion(
+        schema_details,
+        request.query,
+        request.query_plan_before or {},
+        request.execution_time_ms
+    )
+    
+    est_exec_time_after = ai_suggestion.estimated_execution_time_after_ms
     ddl_statement = ai_suggestion.new_index_suggestion
     rewritten = ai_suggestion.rewritten_query
 
@@ -113,89 +120,51 @@ async def get_optimization_suggestion(request: OptimizationRequest):
     logger.info("AI suggestion: rewritten=%s index=%s explanation=%s",
                 rewritten, ddl_statement, ai_suggestion.explanation)
 
-    cost_before = 0
-    if isinstance(request.query_plan_before, dict):
-        cost_before = request.query_plan_before.get("Total Cost", 0)
-    cost_after = cost_before
-    execution_time_after = None
-
+   
     if ddl_statement:
-        is_safe = getattr(ai_analyzer, "is_safe_create_index", lambda s: False)
-        if not is_safe(ddl_statement):
-            ai_suggestion.explanation = (ai_suggestion.explanation or "") + " (index suggestion rejected: unsafe syntax)"
-            print("\nIndex suggestion rejected due to unsafe syntax.")
-            logger.warning("Index suggestion rejected: %s", ddl_statement)
-        else:
-            try:
-                print("\nApplying simulated DDL and running EXPLAIN ANALYZE (in transaction)...")
-                sim = db_inspector.simulate_ddl(engine, ddl_statement, request.query)
-                if sim:
-                    cost_after = sim.get("total_cost") or cost_before
-                    execution_time_after = sim.get("execution_time_ms")
-                    print("\n--- SIMULATION RESULT (AFTER DDL) ---")
-                    print("Total Cost (after):", cost_after)
-                    print("Execution Time (after ms):", execution_time_after)
-                    print("Plan (after):")
-                    print(json.dumps(sim.get("plan") or {}, indent=2))
-                    logger.info("Simulation result after DDL: cost=%s time=%s plan=%s",
-                                cost_after, execution_time_after, json.dumps(sim.get("plan") or {}, ensure_ascii=False))
-                else:
-                    print("\nSimulation returned no result.")
-                    logger.warning("simulate_ddl returned no result for DDL: %s", ddl_statement)
-            except Exception as e:
-                logger.warning("simulate_ddl failed: %s", e)
-                print(f"\nSimulation failed: {e}")
-
+        try:
+            sim = db_inspector.simulate_ddl(engine, ddl_statement, request.query)
+            if sim:
+                logger.info("Simulation result after DDL: %s", json.dumps(sim))
+        except Exception as e:
+            logger.warning("simulate_ddl failed: %s", e)
     elif rewritten:
         try:
-            print("\nRunning EXPLAIN (ANALYZE, FORMAT JSON) on rewritten query...")
             with engine.connect() as conn:
                 explain_q = text(f"EXPLAIN (ANALYZE, FORMAT JSON) {rewritten}")
                 res = conn.execute(explain_q).scalar_one()
-                if isinstance(res, (list, tuple)) and len(res) > 0:
-                    plan_after = res[0].get("Plan")
-                    cost_after = plan_after.get("Total Cost", cost_before) if plan_after else cost_before
-                    execution_time_after = res[0].get("Execution Time")
-                    print("\n--- ANALYZE RESULT (REWRITTEN) ---")
-                    print("Total Cost (after):", cost_after)
-                    print("Execution Time (after ms):", execution_time_after)
-                    print("Plan (after):")
-                    print(json.dumps(plan_after or {}, indent=2))
-                    logger.info("Analyze rewritten query result: cost=%s time=%s plan=%s",
-                                cost_after, execution_time_after, json.dumps(plan_after or {}, ensure_ascii=False))
-                else:
-                    print("\nNo plan returned for rewritten query.")
-                    logger.warning("EXPLAIN returned empty for rewritten query.")
+                logger.info("Analyze rewritten query result: %s", res)
         except Exception as e:
             logger.warning("Could not ANALYZE rewritten query: %s", e)
-            print(f"\nCould not ANALYZE rewritten query: {e}")
-
-    cost_info = ai_analyzer.calculate_cost_slayer(cost_before, cost_after, calls=1)
-    est_exec_time_after = None
-    if execution_time_after is not None:
-        est_exec_time_after = execution_time_after
-    elif request.execution_time_ms and cost_before > 0 and cost_after > 0:
-        improvement_factor = cost_before / cost_after if cost_after > 0 else 1.0
-        est_exec_time_after = request.execution_time_ms / improvement_factor
+            
+    cost_info = ai_analyzer.calculate_cost_slayer(
+        scanned_before_mb=ai_suggestion.estimated_data_scanned_before_mb,
+        scanned_after_mb=ai_suggestion.estimated_data_scanned_after_mb
+    )
 
     print("\n=== SUMMARY ===")
-    print("Total Cost (before):", cost_before)
-    print("Total Cost (after):", cost_after)
-    print("Execution Time (before ms):", request.execution_time_ms)
-    print("Execution Time (after ms) [measured or estimated]:", est_exec_time_after)
-    print("Estimated daily cost:", cost_info.estimated_daily_cost)
-    print("Potential savings %:", cost_info.potential_savings_percentage)
-    print("=== OPTIMIZER: ANALYSIS END ===\n")
+    print(f"Execution Time (before ms): {request.execution_time_ms:.2f}")
+    print(f"Execution Time (after ms) [AI ESTIMATE]: {est_exec_time_after:.2f}" if est_exec_time_after is not None else "Execution Time (after ms) [AI ESTIMATE]: N/A")
+    print(f"Data Scanned (before MB) [AI ESTIMATE]: {ai_suggestion.estimated_data_scanned_before_mb}")
+    print(f"Data Scanned (after MB) [AI ESTIMATE]: {ai_suggestion.estimated_data_scanned_after_mb}")
 
-    logger.info("Summary: cost_before=%s cost_after=%s exec_before=%s exec_after=%s savings=%s%%",
-                cost_before, cost_after, request.execution_time_ms, est_exec_time_after, cost_info.potential_savings_percentage)
+    if cost_info.potential_savings:
+        print("\nPotential Daily Savings (INR):")
+       
+    else:
+        print("\nNo potential cost savings identified.")
+    
+    print("=== OPTIMIZER: ANALYSIS END ===\n")
+    
+    logger.info("Summary: exec_before=%.2f exec_after_est=%.2f",
+                request.execution_time_ms, est_exec_time_after if est_exec_time_after else 0)
+    logger.info("Cost Info: %s", cost_info.model_dump_json())
 
     return OptimizationResult(
         ai_suggestion=ai_suggestion,
         cost_slayer=cost_info,
         estimated_execution_time_after_ms=est_exec_time_after
     )
-
 
 @app.post("/apply", response_model=ApplyResult)
 async def apply_fix(request: ApplyConfirmationRequest):

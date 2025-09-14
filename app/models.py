@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import List, Optional, Any
+from pydantic import BaseModel,  Field
+from typing import List, Optional, Any, Dict
 
 # --- Shared Models ---
 
@@ -7,12 +7,16 @@ class AISuggestion(BaseModel):
     rewritten_query: Optional[str]
     new_index_suggestion: Optional[str]
     explanation: str
+    estimated_execution_time_after_ms: Optional[float]
+    estimated_data_scanned_before_mb: Optional[float]
+    estimated_data_scanned_after_mb: Optional[float]
+
+class ProviderCostSavings(BaseModel):
+    provider_name: str
+    potential_savings_inr_per_call: float
 
 class CostSlayerInfo(BaseModel):
-    estimated_daily_cost: float
-    potential_savings_percentage: float
-    cost_before: float
-    cost_after: float
+    potential_savings: List[ProviderCostSavings]
 
 # --- Request Models ---
 
@@ -25,14 +29,12 @@ class AnalysisRequest(BaseModel):
     file_content: Optional[str] = None
 
 class OptimizationRequest(BaseModel):
-    """
-    Contains all the "before" data for a single query to be optimized.
-    """
     db_uri: str
     query: str
-    query_plan_before: Any
-    # This can be optional as we may not have it for pg_stat_statements queries initially
-    execution_time_ms: Optional[float] = None
+    execution_time_ms: float
+    query_plan_before: Optional[Dict[str, Any]]
+    # ADD THIS LINE:
+    calls: Optional[int] = None
 
 class ApplyConfirmationRequest(BaseModel):
     write_db_uri: str
@@ -59,12 +61,10 @@ class AnalysisSessionResult(BaseModel):
     problems: List[Problem]
 
 class OptimizationResult(BaseModel):
-    """
-    The optimization details for a single query (the "solution").
-    """
     ai_suggestion: AISuggestion
     cost_slayer: CostSlayerInfo
-    estimated_execution_time_after_ms: Optional[float] = None
+    estimated_execution_time_after_ms: Optional[float]
+    
 
 class ApplyResult(BaseModel):
     success: bool

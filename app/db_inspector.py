@@ -56,18 +56,21 @@ def get_schema_details(engine):
             
             tables = connection.execute(query_tables).fetchall()
             for table in tables:
-                schema_info += table[0] + "\n\n"
+                if table and table[0]:
+                    schema_info += table[0] + "\n\n"
             
             views = connection.execute(query_views).fetchall()
             for view in views:
-                schema_info += view[0] + "\n\n"
+                if view and view[0]:
+                    schema_info += view[0] + "\n\n"
             
             indexes = connection.execute(query_indexes).fetchall()
             for index in indexes:
-                schema_info += index[0] + ";\n"
+                if index and index[0]:
+                    schema_info += index[0] + ";\n"
         return schema_info
     except Exception as e:
-        logger.error(f"Error fetching schema details: {e}")
+        logger.error(f"Error fetching schema details: {e}", exc_info=True)
         raise
 
 def get_query_plan(db_connection_or_engine, query: str):

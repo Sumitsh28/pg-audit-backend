@@ -7,8 +7,9 @@ from typing import List
 
 import re
 from typing import List, Dict,  Optional
+from pydantic import BaseModel, Field
 
-from .models import AISuggestion, CostSlayerInfo, Problem, OptimizationResult, ChatMessage 
+from .models import AISuggestion, CostSlayerInfo, Problem, OptimizationResult, ChatMessage , ProviderCostSavings
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -65,25 +66,27 @@ def is_safe_create_index(stmt: str) -> bool:
     return re.match(pattern, s) is not None
 
 
-def validate_and_parse_ai_response(raw: str, required_keys=("rewritten_query","new_index_suggestion","explanation")) -> dict:
+def validate_and_parse_ai_response(raw: str) -> dict:
     """
-    Try to extract a single JSON object from raw model text, parse it, and validate required keys.
-    Returns the parsed dict or raises ValueError.
+    MODIFIED: Now validates the new keys for time and data scan estimates.
     """
+    required_keys = (
+        "rewritten_query", "new_index_suggestion", "explanation",
+        "estimated_execution_time_after_ms",
+        "estimated_data_scanned_before_mb",
+        "estimated_data_scanned_after_mb"
+    )
+
     if not raw or not isinstance(raw, str):
         raise ValueError("Empty or invalid raw response")
-
     
     s = raw.strip()
-
-   
+    
     try:
         obj = json.loads(s)
     except Exception:
-       
         m = re.search(r'(\{(?:[^{}]|(?R))*\})', s, flags=re.DOTALL)
         if not m:
-            
             m2 = re.search(r'(\{.*\})', s, flags=re.DOTALL)
             if not m2:
                 raise ValueError("Could not find JSON object in AI response")
@@ -95,25 +98,30 @@ def validate_and_parse_ai_response(raw: str, required_keys=("rewritten_query","n
         except Exception as e:
             raise ValueError(f"Failed to parse extracted JSON: {e} -- raw snippet: {raw_json[:200]}")
 
-    
     for k in required_keys:
         if k not in obj:
             raise ValueError(f"Missing required key in AI response: {k}")
-        if obj[k] is not None and not isinstance(obj[k], str):
-            raise ValueError(f"Key {k} must be a string or null")
+    
+    if obj["rewritten_query"] is not None and not isinstance(obj["rewritten_query"], str):
+        raise ValueError("Key rewritten_query must be a string or null")
+    if obj["new_index_suggestion"] is not None and not isinstance(obj["new_index_suggestion"], str):
+        raise ValueError("Key new_index_suggestion must be a string or null")
+    if obj["explanation"] is not None and not isinstance(obj["explanation"], str):
+        raise ValueError("Key explanation must be a string or null")
+    
+    for k in ("estimated_execution_time_after_ms", "estimated_data_scanned_before_mb", "estimated_data_scanned_after_mb"):
+        if obj[k] is not None and not isinstance(obj[k], (int, float)):
+             raise ValueError(f"Key {k} must be a number or null")
 
-   
-    for k in ("rewritten_query","new_index_suggestion"):
+    for k in ("rewritten_query", "new_index_suggestion"):
         if obj.get(k) is not None and obj[k].strip() == "":
             obj[k] = None
 
     return obj
 
-def construct_prompt(schema_details: str, query: str, query_plan: dict) -> str:
+def construct_prompt(schema_details: str, query: str, query_plan: dict, execution_time_ms: float) -> str:
     """
-    Constructs an advanced PostgreSQL optimization prompt.
-    Includes multiple rewrite patterns, index suggestions, and cost-aware guidance.
-    AI must output a single minified JSON object: rewritten_query, new_index_suggestion, explanation.
+    CORRECTED VERSION: Combines the original detailed rules with the new estimation requirements.
     """
     top_fields = {}
     if isinstance(query_plan, dict):
@@ -124,7 +132,7 @@ def construct_prompt(schema_details: str, query: str, query_plan: dict) -> str:
     prompt = f"""
 You are an expert PostgreSQL performance analyst. Optimize queries for speed, cost, and scalability.
 Output MUST be a single minified JSON object with EXACT keys: 
-"rewritten_query", "new_index_suggestion", "explanation"
+"rewritten_query", "new_index_suggestion", "explanation", "estimated_execution_time_after_ms", "estimated_data_scanned_before_mb", "estimated_data_scanned_after_mb"
 
 CONTEXT:
 SCHEMA:
@@ -132,6 +140,9 @@ SCHEMA:
 
 SLOW QUERY:
 {query}
+
+INITIAL PERFORMANCE:
+- Execution Time: {execution_time_ms:.2f} ms
 
 QUERY_PLAN:
 {json.dumps(query_plan, ensure_ascii=False)}
@@ -149,23 +160,18 @@ RULES:
 5. If no index is beneficial, set "new_index_suggestion": null.
 6. If query cannot be further optimized, set "rewritten_query": null.
 7. Explanation must briefly justify why the rewrite or index improves performance.
-8. Output JSON ONLY, no extra text, no markdown, no commentary.
-9. Format JSON EXACTLY: 
-   {{"rewritten_query":"...","new_index_suggestion":"...","explanation":"..."}}
+8. **Estimate the new execution time in milliseconds** after your optimization and set it in "estimated_execution_time_after_ms". Be realistic based on the plan changes.
+9. **Estimate the data scanned in megabytes (MB)** before and after your optimization. Set these values in "estimated_data_scanned_before_mb" and "estimated_data_scanned_after_mb".
+10. Output JSON ONLY, no extra text, no markdown, no commentary.
 
-EXAMPLES:
-Original query:
-SELECT fr.title, fr.total_revenue, fc.customer_id, fc.rental_count
-FROM film_revenue fr
-JOIN film_customers fc ON fr.film_id = fc.film_id
-WHERE fr.film_id IN (SELECT film_id FROM film_revenue ORDER BY total_revenue DESC LIMIT 10)
-  AND fc.rental_count = (SELECT MAX(fc2.rental_count) FROM film_customers fc2 WHERE fc2.film_id = fr.film_id);
-
-Optimized output:
+EXAMPLE:
 {{
 "rewritten_query":"WITH top_films AS (SELECT film_id FROM film_revenue ORDER BY total_revenue DESC LIMIT 10), ranked_customers AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY film_id ORDER BY rental_count DESC) AS rn FROM film_customers) SELECT fr.title, fr.total_revenue, rc.customer_id, rc.rental_count FROM film_revenue fr JOIN top_films tf ON fr.film_id = tf.film_id JOIN ranked_customers rc ON fr.film_id = rc.film_id WHERE rc.rn = 1;",
 "new_index_suggestion":"CREATE INDEX idx_film_customers_film_rental ON film_customers(film_id, rental_count);",
-"explanation":"Rewrote per-row MAX() subquery using ROW_NUMBER() window function to avoid repeated scans; added covering index to speed join."
+"explanation":"Rewrote per-row MAX() subquery using ROW_NUMBER() window function to avoid repeated scans; added covering index to speed join.",
+"estimated_execution_time_after_ms": 55.5,
+"estimated_data_scanned_before_mb": 1500.0,
+"estimated_data_scanned_after_mb": 120.0
 }}
 """
     return prompt
@@ -210,62 +216,67 @@ def generate_benchmark_queries(schema_details: str) -> List[str]:
         logger.error(f"Error generating benchmark queries from OpenAI: {e}")
         return []
 
-def get_ai_suggestion(schema_details: str, query: str, query_plan: dict) -> AISuggestion:
+def get_ai_suggestion(schema_details: str, query: str, query_plan: dict, execution_time_ms: float) -> AISuggestion:
     """
-    Returns an AI-optimized suggestion for a given PostgreSQL query.
-    Automatically detects common bottlenecks and augments the prompt.
+    MODIFIED: Now accepts execution_time_ms to pass to the prompt.
     """
     if not client:
         raise ConnectionError("OpenAI client not initialized. Check your API key.")
-
-    patterns = detect_query_patterns(query)
-
-    prompt = construct_prompt(schema_details, query, query_plan)
-    if any(patterns.values()):
-        prompt += f"\nDETECTED_PATTERNS: {patterns}"
+    
+    prompt = construct_prompt(schema_details, query, query_plan, execution_time_ms)
 
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4-turbo", # Using a stronger model can improve estimation quality
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.0,
         )
         content = response.choices[0].message.content
-        try:
-            parsed = validate_and_parse_ai_response(content)
-        except ValueError:
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt + "\nRetry: output EXACT JSON object only."}],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            content = response.choices[0].message.content
-            parsed = validate_and_parse_ai_response(content)
-
-        if len(parsed.get("explanation","")) > 300:
-            parsed["explanation"] = parsed["explanation"][:297] + "..."
-
+        parsed = validate_and_parse_ai_response(content)
         return AISuggestion(**parsed)
 
     except Exception as e:
         logger.error(f"Error in get_ai_suggestion: {e} -- raw_ai: {locals().get('content')}")
-        return AISuggestion(rewritten_query=None, new_index_suggestion=None, explanation=f"AI failed: {e}")
+        return AISuggestion(
+            rewritten_query=None, new_index_suggestion=None, explanation=f"AI failed: {e}",
+            estimated_execution_time_after_ms=None,
+            estimated_data_scanned_before_mb=None,
+            estimated_data_scanned_after_mb=None
+        )
 
 
-def calculate_cost_slayer(cost_before: float, cost_after: float, calls: int) -> CostSlayerInfo:
-    cost_per_query = cost_before * 0.0001
-    daily_cost = cost_per_query * calls
-    potential_savings = 0.0
-    if cost_before > 0:
-        potential_savings = 1 - (cost_after / cost_before)
-    return CostSlayerInfo(
-        estimated_daily_cost=round(daily_cost, 2),
-        potential_savings_percentage=round(potential_savings * 100, 1),
-        cost_before=round(cost_before, 2),
-        cost_after=round(cost_after, 2)
-    )
+def calculate_cost_slayer(scanned_before_mb: float, scanned_after_mb: float) -> CostSlayerInfo:
+    """
+    REWRITTEN: Calculates potential cost savings PER CALL for different cloud providers.
+    """
+    if scanned_before_mb is None or scanned_after_mb is None or scanned_before_mb <= scanned_after_mb:
+        return CostSlayerInfo(potential_savings=[])
+
+    MB_PER_TB = 1024 * 1024
+    USD_TO_INR = 88.27
+
+    providers = {
+        "Google BigQuery": 6.25,
+        "AWS Athena": 5.00
+    }
+    
+    data_saved_mb = scanned_before_mb - scanned_after_mb
+    data_saved_tb = data_saved_mb / MB_PER_TB
+    
+    savings_list = []
+    for name, rate_usd_per_tb in providers.items():
+        # Calculate per-call savings, not daily
+        savings_usd_per_call = data_saved_tb * rate_usd_per_tb
+        savings_inr_per_call = savings_usd_per_call * USD_TO_INR
+        
+        savings_list.append(ProviderCostSavings(
+            provider_name=name,
+            # Use the new field name and DO NOT round the value
+            potential_savings_inr_per_call=savings_inr_per_call 
+        ))
+        
+    return CostSlayerInfo(potential_savings=savings_list)
     
 def get_rag_chat_response(
     schema_details: str,
