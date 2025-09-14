@@ -230,10 +230,10 @@ def generate_benchmark_queries(dialect: str, schema_details: str) -> List[str]:
     """
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-5",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            temperature=0.0,
+            
         )
         content = response.choices[0].message.content
         result_json = json.loads(content)
@@ -254,10 +254,9 @@ def get_ai_suggestion(dialect: str, schema_details: str, query: str, query_plan:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-5",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            temperature=0.0,
         )
         content = response.choices[0].message.content
         parsed = validate_and_parse_ai_response(content)
@@ -368,9 +367,9 @@ def get_rag_chat_response(
 
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-5",
             messages=messages_for_api,
-            temperature=0.1,
+            
         )
         return response.choices[0].message.content
     except Exception as e:
