@@ -176,6 +176,6 @@ All endpoints are relative to the base URL (e.g., `http://127.0.0.1:8000`).
 
 
 
-
 ## Demo
-![Watch Here!](https://drive.google.com/file/d/10oYOsLu_0BOSoJET_PCkCdawq9mXqZtF/view?usp=drive_link)
+[▶ Watch the demo](https://drive.google.com/file/d/10oYOsLu_0BOSoJET_PCkCdawq9mXqZtF/view?usp=drive_link)
+
